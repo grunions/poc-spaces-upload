@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<title></title>
+</head>
+
+<body>
+
+	<h1>Directory Upload</h1>
+
+	<form action="/upload-dir" method="post" enctype="multipart/form-data">
+		<input id="file" type="file" name="files" directory webkitdirectory mozdirectory>
+		<input type="submit" value="Submit">
+	</form>
+
+	<h1>Multifile Upload</h1>
+
+	<form action="/upload-files" method="post" enctype="multipart/form-data">
+		<input id="file" type="file" name="files" multiple>
+		<input type="submit" value="Submit">
+	</form>
+
+	<script>
+		fileschanged = function (e) {
+			console.log("triggered");
+			var files = this.files;
+			var table = {};
+
+			for (var i = 0; i < files.length; i++) {
+				var f = files[i];
+				var dt = new Date(f.lastModified);
+
+				table[i] = {
+					path: f.webkitRelativePath,
+					size: f.size,
+					modified: dt.toLocaleString()
+				};
+			}
+
+			console.table(table);
+		};
+
+		window.onload = function () {
+			console.log("loaded");
+			var e = document.getElementById('file');
+			e.oninput = fileschanged;
+			e.onpropertychange = e.oninput; // for IE8
+			//e.onchange = e.oninput; // FF needs this in <select><option>...
+		};
+	</script>
+
+</body>
+
+</html>
