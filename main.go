@@ -5,13 +5,17 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"fmt"
+	"hash"
 	"html/template"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/miolini/datacounter"
 	pb "gopkg.in/cheggaaa/pb.v1"
@@ -52,18 +56,71 @@ func init() {
 
 }
 
-// Blob is a Remote gzip compressed object, which may either be a single file
+// Blob is a gzip compressed object, which may either be a single file
 // or a directory in a tar file
 type Blob struct {
-	IsDir            bool
-	Size             int64
-	UncompressedSize int64
-	Hash             []byte
+	IsDir bool
+
+	File *os.File
+
+	gw  io.WriteCloser             // gzip writer for compression
+	hw  hash.Hash                  // hashwriter for checksum
+	ccw *datacounter.WriterCounter // countWriter for counting written compressed bytes
+	ucw *datacounter.WriterCounter // countWriter for counting written uncompressed bytes
+	mw  io.Writer                  // multiWriter for combining hash and gzip
 
 	// A human readable reference, for example a filename associated with the
 	// blob, e.g. "Human Music.mp3". This is non-unique, user-controlled and
 	// must not be used for any logic.
 	Reference string
+}
+
+func NewBlob() (*Blob, error) {
+	blob := &Blob{
+		IsDir: false,
+	}
+
+	var err error
+
+	blob.File, err = ioutil.TempFile("", "blob")
+	if err != nil {
+		return nil, errors.Wrap(err, "Blob: could not create temporary file")
+	}
+
+	blob.ccw = datacounter.NewWriterCounter(blob.File)
+	blob.gw, _ = gzip.NewWriterLevel(blob.ccw, gzip.BestCompression)
+	blob.ucw = datacounter.NewWriterCounter(blob.gw)
+	blob.hw = sha256.New()
+	blob.mw = io.MultiWriter(blob.ucw, blob.hw)
+
+	return blob, nil
+}
+
+// Close finishes the writing process to the blob
+func (blob *Blob) Close() error {
+	blob.gw.Close()
+	return blob.File.Close()
+}
+
+// Size returns the Compressed blob size
+func (blob *Blob) Size() int64 {
+	return int64(blob.ccw.Count())
+}
+
+// UncompressedSize returns the original size, or the size of the
+// Tar file if the blob is a dir blob
+func (blob *Blob) UncompressedSize() int64 {
+	return int64(blob.ucw.Count())
+}
+
+// Hash returns the checksum of the uncompressed data
+func (blob *Blob) Hash() []byte {
+	return blob.hw.Sum(nil)
+}
+
+// Write implements the standard Write interface
+func (blob *Blob) Write(b []byte) (n int, err error) {
+	return blob.mw.Write(b)
 }
 
 func index(w http.ResponseWriter, req *http.Request) {
@@ -78,41 +135,26 @@ func Reader(client *minio.Client, hash []byte) (io.ReadCloser, error) {
 	return o, nil
 }
 
-func ReaderToBlob(fr io.Reader) (tmppath string, blob *Blob, e error) {
+func ReaderToBlob(fr io.Reader) (blob *Blob, e error) {
 
-	tmpfile, err := ioutil.TempFile("", "upload")
+	blob, err := NewBlob()
 	if err != nil {
-		os.Remove(tmpfile.Name()) // try to clean up
-		return "", nil, errors.Wrap(err, "Could not create Temporary file")
+		blob.Close()
+		os.Remove(blob.File.Name()) // try to clean up
+		return nil, errors.Wrap(err, "Could not create blob")
 	}
-	defer tmpfile.Close()
-
-	cw := datacounter.NewWriterCounter(tmpfile)
-
-	gw := gzip.NewWriter(cw)
-	defer gw.Close()
-
-	hw := sha256.New() // hash to generate a checksum
-
-	// mw writes both to the gzip writer, as well as make a checksum
-	mw := io.MultiWriter(hw, gw)
+	defer blob.Close()
 
 	// copy file reader into the chain
-	written, err := io.Copy(mw, fr)
+	_, err = io.Copy(blob, fr)
 	if err != nil {
-		os.Remove(tmpfile.Name()) // try to clean up
-		return "", nil, errors.Wrap(err, "Error while processing")
+		os.Remove(blob.File.Name()) // try to clean up
+		return nil, errors.Wrap(err, "Error while processing")
 	}
 
-	gw.Close() // flush all remaining bytes
-	blob = &Blob{
-		IsDir:            false,
-		Size:             int64(cw.Count()),
-		UncompressedSize: written,
-		Hash:             hw.Sum(nil),
-	}
+	blob.Close() // flush all remaining bytes
 
-	return tmpfile.Name(), blob, nil
+	return blob, nil
 }
 
 // CheckDuplicate return true if a duplicate exists
@@ -129,7 +171,7 @@ func CheckDuplicate(client *minio.Client, blob *Blob) bool {
 		return false
 	}
 
-	if blob.Size != info.Size {
+	if blob.Size() != info.Size {
 		// size does not match
 		return false
 	}
@@ -138,10 +180,10 @@ func CheckDuplicate(client *minio.Client, blob *Blob) bool {
 	return true
 }
 
-func UploadBlob(client *minio.Client, path string, blob *Blob) error {
-	remoteFilename := fmt.Sprintf("blob/%x", blob.Hash)
+func UploadBlob(client *minio.Client, blob *Blob) error {
+	remoteFilename := fmt.Sprintf("blob/%x", blob.Hash())
 
-	bar := pb.New64(blob.Size)
+	bar := pb.New64(blob.Size())
 	bar.ShowSpeed = true
 	bar.ShowElapsedTime = true
 	bar.ShowTimeLeft = true
@@ -153,12 +195,12 @@ func UploadBlob(client *minio.Client, path string, blob *Blob) error {
 	written, err := client.FPutObject(
 		config.S3.Bucket,
 		remoteFilename,
-		path,
+		blob.File.Name(),
 		minio.PutObjectOptions{
 			Progress:    bar,
 			ContentType: "application/gzip",
 			UserMetadata: map[string]string{
-				"Uncompressed-Size": strconv.FormatInt(blob.UncompressedSize, 10),
+				"Uncompressed-Size": strconv.FormatInt(blob.UncompressedSize(), 10),
 				"Reference-Name":    blob.Reference,
 				"Is-Dir":            strconv.FormatBool(blob.IsDir),
 			},
@@ -171,6 +213,146 @@ func UploadBlob(client *minio.Client, path string, blob *Blob) error {
 	}
 
 	return nil
+}
+
+func TarDir(src string, writer io.Writer) error {
+	// ensure the src actually exists before trying to tar it
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("Unable to tar files - %v", err.Error())
+	}
+
+	tw := tar.NewWriter(writer)
+	defer tw.Close()
+
+	// reusable buffer for io.CopyBuffer
+	copyBuffer := make([]byte, 32*1024)
+
+	// walk path
+	return filepath.Walk(src, func(file string, fi os.FileInfo, err error) error {
+
+		// return on any error
+		if err != nil {
+			return err
+		}
+
+		// create a new dir/file header
+		header, err := tar.FileInfoHeader(fi, fi.Name())
+		if err != nil {
+			return err
+		}
+
+		// reset modification time, to make output deterministic
+		header.ModTime = time.Time{}
+
+		// update the name to correctly reflect the desired destination when untaring
+		header.Name = strings.TrimPrefix(strings.Replace(file, src, "", -1), string(filepath.Separator))
+
+		// write the header
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		// return on non-regular files for this suggested update)
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
+
+		// open files for taring
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+
+		// copy file data into tar writer
+		if _, err := io.CopyBuffer(tw, f, copyBuffer); err != nil {
+			return err
+		}
+
+		// manually close here after each file operation; defering would cause each file close
+		// to wait until all operations have completed.
+		f.Close()
+
+		return nil
+	})
+
+}
+
+// Untargz takes a destination path and a reader; a tar reader loops over the tarfile
+// creating the file structure at 'dst' along the way, and writing any files
+func Untargz(dst string, r io.Reader) error {
+
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	// reusable buffer for io.CopyBuffer
+	copyBuffer := make([]byte, 32*1024)
+
+	for {
+		header, err := tr.Next()
+
+		switch {
+
+		// if no more files are found return
+		case err == io.EOF:
+			return nil
+
+		// return any other error
+		case err != nil:
+			return err
+
+		// if the header is nil, just skip it (not sure how this happens)
+		case header == nil:
+			continue
+		}
+
+		// the target location where the dir/file should be created
+		target := filepath.Join(dst, header.Name)
+
+		// the following switch could also be done using fi.Mode(), not sure if there
+		// a benefit of using one vs. the other.
+		// fi := header.FileInfo()
+
+		// check the file type
+		switch header.Typeflag {
+
+		// if its a dir and it doesn't exist create it
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+
+		// if it's a file create it
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+
+			// copy over contents
+			if _, err := io.CopyBuffer(f, tr, copyBuffer); err != nil {
+				return err
+			}
+
+			// manually close here after each file operation; defering would cause each file close
+			// to wait until all operations have completed.
+			f.Close()
+
+		case tar.TypeSymlink:
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return err
+			}
+
+		default:
+			log.Print("Tar: ignoring unknown tar header")
+		}
+	}
 }
 
 func directoryUpload(w http.ResponseWriter, req *http.Request) {
@@ -204,29 +386,18 @@ func directoryUpload(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	tmpfile, err := ioutil.TempFile("", "upload")
+	blob, err := NewBlob()
 	if err != nil {
 		fmt.Fprintln(w, "error opening archive")
-		log.Printf("error opening archive: %s", err)
+		log.Printf("error creating blob: %s", err)
 		return
 	}
-	defer os.Remove(tmpfile.Name())
-	defer tmpfile.Close()
+	blob.IsDir = true
+	defer os.Remove(blob.File.Name())
+	defer blob.Close()
 
-	gw, err := gzip.NewWriterLevel(tmpfile, gzip.BestCompression)
-	if err != nil {
-		fmt.Fprintln(w, "error initializing compression")
-		log.Printf("error initializing compression: %s", err)
-		return
-	}
-
-	defer gw.Close()
-	hw := sha256.New() // hash to generate a checksum
-	mw := io.MultiWriter(hw, gw)
-	tw := tar.NewWriter(mw)
+	tw := tar.NewWriter(blob)
 	defer tw.Close()
-
-	var total int64
 
 	for _, file := range files {
 		fr, err := file.Open()
@@ -245,50 +416,27 @@ func directoryUpload(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		copied, err := io.Copy(tw, fr)
+		_, err = io.Copy(tw, fr)
 		if err != nil {
 			fmt.Fprintln(w, err)
 			log.Print(err)
 			return
 		}
 
-		if copied != file.Size {
-			fmt.Fprintf(w,
-				"WARNING: Filesize does not match amount uploaded!! (%d vs %d)",
-				file.Size, copied)
-			log.Print("Warning: filesize doesnt match!")
-		}
-
-		fmt.Fprintf(w, "Uploaded %10d byte: %s\n", copied, file.Filename)
-		total += copied
+		fmt.Fprintf(w, "Uploaded %s\n", file.Filename)
 		fr.Close()
 	}
 
-	tw.Close()
-	gw.Close()
-	tmpfile.Sync()
+	tw.Close() // flush remaining bytes
+	blob.Close()
 
-	filestat, err := tmpfile.Stat()
-	if err != nil {
-		panic(err)
-	}
-	filesize := filestat.Size()
-	tmpfile.Close()
-
-	blob := &Blob{
-		IsDir:            true,
-		Size:             filesize,
-		UncompressedSize: total,
-		Hash:             hw.Sum(nil),
-		Reference:        "Dir",
-	}
-
-	if err := UploadBlob(client, tmpfile.Name(), blob); err != nil {
+	if err := UploadBlob(client, blob); err != nil {
 		panic(err)
 	}
 
-	fmt.Fprintf(w, "Upload completed. compressed %d bytes into %d (ratio of %0.3f)\n", total, filesize, (float64(filesize) / float64(total)))
-	fmt.Fprintf(w, "Checksum: %x\n", hw.Sum(nil))
+	fmt.Fprintf(w, "Upload completed. compressed %d bytes into %d (ratio of %0.3f)\n",
+		blob.UncompressedSize(), blob.Size(),
+		(float64(blob.Size()) / float64(blob.UncompressedSize())))
 	return
 }
 
@@ -329,13 +477,13 @@ func multiUpload(w http.ResponseWriter, req *http.Request) {
 		}
 		defer fr.Close()
 
-		tmppath, blob, err := ReaderToBlob(fr)
+		blob, err := ReaderToBlob(fr)
 		if err != nil {
 			fmt.Fprintln(w, "Error")
 			log.Printf("Error: %s", err)
 			return
 		}
-		defer os.Remove(tmppath)
+		defer os.Remove(blob.File.Name())
 
 		// set optional reference
 		blob.Reference = file.Filename
@@ -346,7 +494,7 @@ func multiUpload(w http.ResponseWriter, req *http.Request) {
 			continue
 		}
 
-		err = UploadBlob(client, tmppath, blob)
+		err = UploadBlob(client, blob)
 		if err != nil {
 			fmt.Fprintln(w, "Error")
 			log.Printf("Error: %s", err)
